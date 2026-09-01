@@ -161,21 +161,27 @@ async def store_secret(
             detail=f"Storage error: {str(err)}",
         )
 
-    # Trigger Non-Blocking Background Tasks for Email Dispatch
+
+# Trigger Non-Blocking Background Tasks for Email Dispatch
     if recipient_emails_json and send_share_notification_email:
         try:
             recipient_emails = json.loads(recipient_emails_json)
-            for share in stored_secret.shares:
-                idx = share.share_index - 1
-                if idx < len(recipient_emails):
-                    background_tasks.add_task(
-                        send_share_notification_email,
-                        recipient_email=recipient_emails[idx],
-                        secret_title=stored_secret.title,
-                        share_index=share.share_index,
-                        stego_image_bytes=share.stego_image_data,
-                        stego_filename=f"share_{share.share_index}.png",
-                    )
+            # Collect all generated stego PNG image bytes into a single list
+            all_stego_bytes = [
+                share.stego_image_data
+                for share in stored_secret.shares
+                if share.stego_image_data is not None
+            ]
+
+            # Send 1 single email containing ALL stego attachments to every recipient
+            for email in recipient_emails:
+                background_tasks.add_task(
+                    send_share_notification_email,
+                    recipient_email=email,
+                    secret_title=stored_secret.title,
+                    stego_shares=all_stego_bytes,
+                    stego_filename="stego_share.png",
+                )
         except Exception:
             pass
 
