@@ -73,11 +73,11 @@ class TokenRequestSchema(BaseModel):
 class VerifyAndReconstructSchema(BaseModel):
     secret_id: str
     token: str
-    email: Optional[str] = None   # <-- NEW: for (secret_id + email + role + otp) check
-    role: Optional[str] = None    # <-- NEW: for (secret_id + email + role + otp) check
+    email: Optional[str] = None   # <-- for (secret_id + token + email + role) check
+    role: Optional[str] = None    # <-- for (secret_id + token + email + role) check
     # Include any other fields your reconstruction payload requires (e.g., list of shares or share data)
     share_indices: list[int] = []
-    stego_images: Optional[List[str]] = None   # <-- NEW: Base64-encoded stego PNGs (JSON safe)
+    stego_images: Optional[List[str]] = None   # Base64-encoded stego PNGs (JSON safe)
     provided_shares_hex: Optional[List[str]] = None
     recipient_private_keys_pem: Optional[List[str]] = None
 
@@ -104,7 +104,7 @@ async def store_secret(
     role_public_keys_json: Optional[str] = Form(None),
     cover_images: Optional[List[UploadFile]] = File(None),
     recipient_emails_json: Optional[str] = Form(None),
-    authorized_recipients_json: Optional[str] = Form(None),   # <-- NEW: [{email, role}, ...]
+    authorized_recipients_json: Optional[str] = Form(None),   # <-- [{email, role}, ...]
     db: Session = Depends(get_db),
     current_user: Optional[object] = Depends(get_current_user),
 ):
@@ -430,113 +430,132 @@ async def reconstruct_secret(
 @router.post("/request-token")
 def request_reconstruction_token(payload: TokenRequest, db: Session = Depends(get_db)):
     """
-    Step 1: Validates that the (email, role) pair is authorized for this secret,
-    then sends a 6-digit verification OTP to the recipient's email.
+    Step 1: STRICT authorization gate.
+    - The (email, role) pair MUST exist in the secret's authorized_recipients.
+    - If not, we return 403 immediately and DO NOT send any email or create any OTP.
     """
+    # 1. Look up the secret
+    secret = db.query(EncryptedSecret).filter(EncryptedSecret.id == payload.secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found.")
+
+    # 2. Load stored authorized recipients — MUST exist and MUST match
+    stored_raw = getattr(secret, "authorized_recipients", None)
+
+    authorized_list = []
+    if stored_raw:
+        try:
+            authorized_list = json.loads(stored_raw) if isinstance(stored_raw, str) else stored_raw
+        except Exception:
+            authorized_list = []
+
+    requested_email = payload.email.strip().lower()
+    requested_role = payload.role.strip()
+
+    is_authorized = any(
+        str(r.get("email", "")).strip().lower() == requested_email
+        and str(r.get("role", "")).strip() == requested_role
+        for r in authorized_list
+    )
+
+    # 3. FAIL FAST — no email, no OTP, no DB write if not authorized
+    if not is_authorized:
+        AuditService.log_event(
+            db=db,
+            event_type="RECONSTRUCTION_TOKEN_REQUESTED",
+            actor_id=payload.email,
+            status="FAILURE",
+            details=f"Unauthorized email/role for secret {payload.secret_id}",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: Email {payload.email} with role {payload.role} is not authorized for this secret.",
+        )
+
+    # 4. ONLY NOW generate and send the OTP
     try:
-        # 1. Look up the secret
-        secret = db.query(EncryptedSecret).filter(EncryptedSecret.id == payload.secret_id).first()
-        if not secret:
-            raise HTTPException(status_code=404, detail="Secret not found.")
-
-        # 2. Validate (email, role) against stored authorized_recipients
-        stored_raw = getattr(secret, "authorized_recipients", None)
-        if stored_raw:
-            try:
-                authorized_list = json.loads(stored_raw) if isinstance(stored_raw, str) else stored_raw
-            except Exception:
-                authorized_list = []
-
-            is_authorized = any(
-                str(r.get("email", "")).lower() == payload.email.lower()
-                and str(r.get("role", "")) == payload.role
-                for r in authorized_list
-            )
-
-            if not is_authorized:
-                AuditService.log_event(
-                    db=db,
-                    event_type="SECRET_RECONSTRUCTION_ATTEMPT",
-                    actor_id=payload.email,
-                    status="FAILURE",
-                    details=f"Unauthorized role/email for secret {payload.secret_id}",
-                )
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Access denied: Email {payload.email} with role {payload.role} is not authorized for this secret.",
-                )
-        # If the secret has no authorized_recipients stored, fall through (legacy permissive mode)
-
-        # 3. Generate & send OTP
         generate_reconstruction_token(
             db=db,
             secret_id=payload.secret_id,
             email=payload.email,
             role=payload.role,
         )
-
-        AuditService.log_event(
-            db=db,
-            event_type="RECONSTRUCTION_TOKEN_REQUESTED",
-            actor_id=payload.email,
-            status="SUCCESS",
-            details=f"OTP token dispatched for secret {payload.secret_id}",
-        )
-
-        return {
-            "message": "Verification token sent successfully.",
-            "role": payload.role,
-        }
-
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error generating token: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+    AuditService.log_event(
+        db=db,
+        event_type="RECONSTRUCTION_TOKEN_REQUESTED",
+        actor_id=payload.email,
+        status="SUCCESS",
+        details=f"OTP token dispatched for secret {payload.secret_id}",
+    )
+
+    return {
+        "message": "Verification token sent successfully.",
+        "role": payload.role,
+    }
 
 
 @router.post("/verify-and-reconstruct")
 def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Session = Depends(get_db)):
     """
-    Step 2: Validates the email OTP token before executing the mathematical secret reconstruction.
+    Step 2: STRICT 2FA gate — validates secret_id + token + email + role
+    BEFORE any reconstruction math runs.
     """
-    # 1. Verify the 6-digit token (now also checks email + role when provided)
     from app.models.domain import ReconstructionToken
     from datetime import datetime, timezone
+    from sqlalchemy import func
 
+    # Require email AND role for the strict gate
+    if not payload.email or not payload.role:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email and role are required to verify the reconstruction token.",
+        )
+
+    # ==================================================================
+    # STEP 1: STRICTLY CHECK THE TOKEN, EMAIL, ROLE, AND SECRET ID FIRST
+    # ==================================================================
     now_utc = datetime.now(timezone.utc)
 
-    query = db.query(ReconstructionToken).filter(
-        ReconstructionToken.secret_id == payload.secret_id,
-        ReconstructionToken.token == payload.token,
-        ReconstructionToken.is_used == False,
-        ReconstructionToken.expires_at > now_utc,
+    token_record = (
+        db.query(ReconstructionToken)
+        .filter(
+            ReconstructionToken.secret_id == payload.secret_id,
+            ReconstructionToken.token == payload.token,
+            func.lower(ReconstructionToken.email) == payload.email.strip().lower(),
+            ReconstructionToken.role == payload.role.strip(),
+            ReconstructionToken.is_used == False,
+            ReconstructionToken.expires_at > now_utc,
+        )
+        .first()
     )
-    if payload.email:
-        query = query.filter(ReconstructionToken.email == payload.email)
-    if payload.role:
-        query = query.filter(ReconstructionToken.role == payload.role)
 
-    db_token = query.first()
-
-    if not db_token:
+    # ==================================================================
+    # STEP 2: IF NO MATCH, BLOCK IT IMMEDIATELY (DO NOT PROCEED TO MATH)
+    # ==================================================================
+    if not token_record:
         AuditService.log_event(
             db=db,
             event_type="SECRET_RECONSTRUCTION_ATTEMPT",
-            actor_id=payload.email or "Unknown / Unauthorized",
+            actor_id=payload.email,
             status="FAILURE",
-            details=f"Invalid or expired OTP token provided for secret {payload.secret_id}",
+            details=f"Invalid OTP or email/role mismatch for secret {payload.secret_id}",
         )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired verification token. Access denied."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access Denied: Invalid OTP, or this email/role is not authorized for this session.",
         )
 
-    # Mark token as used (single-use)
-    db_token.is_used = True
+    # Mark token as used (single-use) — only after the gate passed
+    token_record.is_used = True
     db.commit()
 
-    # 2. Token is valid! Proceed with your underlying mathematical secret reconstruction logic
+    # ==================================================================
+    # STEP 3: ONLY IF STEP 2 PASSED, RUN THE SHAMIR RECONSTRUCTION MATH
+    # ==================================================================
     try:
         secret_service = SecretService(db)
 
@@ -547,10 +566,9 @@ def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Sessi
                 try:
                     stego_bytes_list.append(base64.b64decode(b64_str))
                 except Exception:
-                    # Skip malformed entries
                     continue
 
-        # Call the existing reconstruction pipeline
+        # --- The actual mathematical reconstruction ---
         decrypted_raw = secret_service.reconstruct_secret(
             secret_id=payload.secret_id,
             provided_shares=payload.provided_shares_hex,
@@ -563,7 +581,7 @@ def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Sessi
         else:
             decrypted_bytes = decrypted_raw
 
-        # 3. Unpack the encrypted envelope (same logic as /reconstruct)
+        # Unpack the encrypted envelope
         final_secret = None
         is_file = False
         filename = None
@@ -585,10 +603,8 @@ def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Sessi
             else:
                 final_secret = base64.b64decode(payload_b64).decode("utf-8")
         except Exception:
-            # Fallback for legacy raw secrets
             final_secret = decrypted_bytes.decode("utf-8", errors="ignore")
 
-        # Safely unwrap dict/object results if the pipeline ever returns them
         if isinstance(final_secret, dict):
             final_secret = (
                 final_secret.get("secret")
@@ -602,9 +618,9 @@ def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Sessi
         AuditService.log_event(
             db=db,
             event_type="SECRET_RECONSTRUCTED",
-            actor_id=payload.email or "Authenticated Recipient",
+            actor_id=payload.email,
             status="SUCCESS",
-            details=f"Secret {payload.secret_id} successfully reconstructed via 2FA OTP verification.",
+            details=f"Secret {payload.secret_id} reconstructed by {payload.email} [{payload.role}].",
         )
 
         return {
@@ -617,6 +633,7 @@ def verify_and_reconstruct_secret(payload: VerifyAndReconstructSchema, db: Sessi
             "file_data_b64": file_data_b64,
         }
     except Exception as e:
+        logger.error(f"Reconstruction failed after token verification: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Reconstruction failed after token verification: {str(e)}"
