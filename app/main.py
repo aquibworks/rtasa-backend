@@ -13,13 +13,14 @@ from app.api.v1.router import api_v1_router
 # Database imports
 from app.db.session import engine, Base
 
-# Import models so SQLAlchemy registers tables
+# Import models so SQLAlchemy registers tables (including new AuditLog)
 from app.models.domain import EncryptedSecret, ShareRecord, User
+from app.models.audit import AuditLog
 
 
 def create_application() -> FastAPI:
 
-    # Create database tables
+    # Create database tables (automatically includes audit_logs)
     Base.metadata.create_all(bind=engine)
 
     application = FastAPI(

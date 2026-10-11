@@ -1,5 +1,6 @@
 import logging
 from sqlalchemy.orm import Session
+from app.services.audit_service import AuditService
 from app.engine.aes_gcm import AESGCMEngine
 from app.engine.shamir import ShamirEngine
 from app.engine.stego import StegoEngine
@@ -9,7 +10,7 @@ from app.repositories.secret_repository import SecretRepository
 from app.core.exceptions import RTASAException
 from app.models.domain import EncryptedSecret
 from app.models.domain import EncryptedSecret, ShareRecord, User
-    
+
 
 class SecretService:
 
@@ -80,7 +81,8 @@ class SecretService:
         db.commit()
         db.refresh(secret_record)
         return secret_record
-    
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,7 +203,7 @@ class SecretService:
             )
 
         # Step 5: Persist atomically to database
-        return self.secret_repo.create_secret_with_shares(
+        stored_secret = self.secret_repo.create_secret_with_shares(
             owner_id=owner_id,
             title=title,
             ciphertext=ciphertext,
@@ -211,12 +213,29 @@ class SecretService:
             shares=processed_shares
         )
 
+        # Record successful storage in tamper-evident audit logs
+        AuditService.log_event(
+            db=self.secret_repo.db,
+            event_type="SECRET_STORED",
+            actor_id=owner_id,
+            details={
+                "secret_id": str(stored_secret.id),
+                "title": title,
+                "threshold_k": threshold_k,
+                "total_shares_n": total_shares_n
+            },
+            status="SUCCESS"
+        )
+
+        return stored_secret
+
     def reconstruct_secret(
         self,
         secret_id: str,
         provided_shares: list[bytes] | list[tuple[int, bytes]] | None = None,
         provided_stego_images: list[bytes] | None = None,
-        recipient_private_keys: list[bytes] | None = None
+        recipient_private_keys: list[bytes] | None = None,
+        actor_id: str | None = None
     ) -> bytes:
         """
         Orchestrates full recombination & decryption workflow:
@@ -312,6 +331,17 @@ class SecretService:
             ciphertext=secret.ciphertext,
             nonce=secret.nonce,
             key=reconstructed_key
+        )
+
+        # Record successful reconstruction in tamper-evident audit logs
+        AuditService.log_event(
+            db=self.secret_repo.db,
+            event_type="SECRET_RECONSTRUCTED",
+            actor_id=actor_id or "system",
+            details={
+                "secret_id": str(secret_id) if 'secret_id' in locals() else "unknown"
+            },
+            status="SUCCESS"
         )
 
         return decrypted_secret
