@@ -5,6 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.session import Base
 
 
+
 def generate_uuid() -> str:
     return str(uuid.uuid4())
 
@@ -43,6 +44,7 @@ class EncryptedSecret(Base):
     nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     threshold_k: Mapped[int] = mapped_column(Integer, nullable=False)
     total_shares_n: Mapped[int] = mapped_column(Integer, nullable=False)
+    authorized_recipients: Mapped[str | None] = mapped_column(Text, nullable=True)   # <-- ADD THIS LINE
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     owner: Mapped["User"] = relationship("User", back_populates="secrets")
